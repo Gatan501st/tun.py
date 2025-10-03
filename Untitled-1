@@ -1,0 +1,79 @@
+#!/usr/bin/python3
+import select
+import fcntl
+import struct
+import os
+import time
+from scapy.all import *
+
+# CLIENT CONFIGURATION
+tunnelremoteprealip = "10.9.0.11"      # Server's IP
+tunnelremoteprealport = 9090
+tunnellocalip = "192.168.30.99"        # Client tunnel IP
+tunnelremoteip = "192.168.53.100"      # Server tunnel IP
+tunneltargetsubnet = "192.168.60.0"
+tunneltargetsubnetmask = "24"
+
+TUNSETIFF = 0x400454ca
+IFF_TUN = 0x0001
+IFF_TAP = 0x0002
+IFF_NO_PI = 0x1000
+
+# Create the TUN interface 
+tun = os.open("/dev/net/tun", os.O_RDWR)
+ifr = struct.pack('16sH', b'tun%d', IFF_TUN | IFF_NO_PI)  # FIXED: Use IFF_TUN
+ifname_bytes = fcntl.ioctl(tun, TUNSETIFF, ifr)
+
+# Get the interface name
+ifname = ifname_bytes.decode('UTF-8')[:16].strip("\x00")
+print("Interface Name: {}".format(ifname))
+
+# Setup point-to-point tunnel (FIXED: use peer, not /24)
+print("Setup the IP and bring the interface up")
+print("ip addr add {} peer {} dev {}".format(tunnellocalip, tunnelremoteip, ifname))
+print("ip link set dev {} up".format(ifname))
+os.system("ip addr add {} peer {} dev {}".format(tunnellocalip, tunnelremoteip, ifname))
+os.system("ip link set dev {} up".format(ifname))
+
+# Setup the IP route to target subnet (FIXED: removed 'via')
+print("Setup the IP route to target subnet")
+print("ip route add {}/{} dev {}".format(tunneltargetsubnet, tunneltargetsubnetmask, ifname))
+os.system("ip route add {}/{} dev {}".format(tunneltargetsubnet, tunneltargetsubnetmask, ifname))
+
+# Create UDP socket for sending
+sockTX = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+# Create UDP socket for receiving
+IP_A = "0.0.0.0"
+PORT = 9090
+sockRx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sockRx.bind((IP_A, PORT))
+
+print("\n=== VPN CLIENT Started ===")
+print("Tunnel: {} <-> {}".format(tunnellocalip, tunnelremoteip))
+print("Server: {}:{}".format(tunnelremoteprealip, tunnelremoteprealport))
+print("Target: {}/{}".format(tunneltargetsubnet, tunneltargetsubnetmask))
+print("===========================\n")
+
+# FIXED: Complete select loop with both directions
+while True:
+    # Wait for data from either UDP socket or TUN interface
+    ready, _, _ = select.select([sockRx, tun], [], [])
+    
+    for fd in ready:
+        if fd is sockRx:
+            # Received packet from UDP tunnel
+            data, (ip, port) = sockRx.recvfrom(2048)
+            print("UDP: {}:{} --> {}:{}".format(ip, port, IP_A, PORT))
+            pkt = IP(data)
+            print("  Inner: {} --> {}".format(pkt.src, pkt.dst))
+            # Write decapsulated packet to TUN interface
+            os.write(tun, bytes(pkt))
+        
+        if fd is tun:
+            # Received packet from TUN interface (going out)
+            packet = os.read(tun, 2048)
+            pkt = IP(packet)
+            print("TUN: {} --> {}".format(pkt.src, pkt.dst))
+            # Encapsulate and send via UDP tunnel
+            sockTX.sendto(packet, (tunnelremoteprealip, tunnelremoteprealport))
